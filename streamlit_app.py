@@ -63,7 +63,8 @@ def predict(model, img):
 
 # ---------------- UI ----------------
 st.set_page_config(page_title="Skin Lesion Classifier", page_icon="🔬")
-st.title("Skin Lesion Classifier — Decision-Support Demo")
+st.title("Skin Lesion Classifier")
+st.header("Decision-Support Demo")
 st.markdown(
     "Upload a dermatoscopic image (or pick an example). The model — a **ResNet18** "
     "transfer-learned on **HAM10000** — returns its confidence across 7 lesion types."

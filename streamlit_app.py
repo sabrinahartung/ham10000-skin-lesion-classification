@@ -9,6 +9,8 @@ Streamlit app: upload a dermatoscopic image (or pick an example); a ResNet18 mod
 import base64
 from pathlib import Path
 
+import matplotlib
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -61,9 +63,70 @@ def predict(model, img):
     return {CLASSES[i]: float(probs[i]) for i in range(NUM_CLASSES)}
 
 
+def gradcam(model, img, class_idx):
+    """Grad-CAM heatmap for `class_idx`, as a raw (un-normalised) [7, 7] tensor.
+
+    Weights the last conv block's feature maps by the gradient of that class's
+    logit w.r.t. them: channels the score reacts to strongly count most.
+
+    Deliberately *not* normalised here — the caller scales several classes
+    against one shared maximum, so a weak explanation still looks weak.
+    Per-map normalisation would stretch pure noise to full contrast.
+    """
+    x = preprocess(img.convert("RGB")).unsqueeze(0)
+    layer = model.layer4[-1]  # last residual block -> 7x7 feature maps
+
+    activations, gradients = {}, {}
+    handles = [
+        layer.register_forward_hook(lambda m, inp, out: activations.update(v=out)),
+        layer.register_full_backward_hook(lambda m, gi, go: gradients.update(v=go[0])),
+    ]
+    try:
+        logits = model(x)
+        model.zero_grad(set_to_none=True)
+        logits[0, class_idx].backward()
+    finally:
+        for h in handles:
+            h.remove()
+
+    acts, grads = activations["v"][0], gradients["v"][0]  # both [C, 7, 7]
+    weights = grads.mean(dim=(1, 2), keepdim=True)
+    # ReLU keeps only evidence *for* the class; negative contributions are dropped.
+    return (weights * acts).sum(dim=0).relu().detach()
+
+
+def overlay_cam(img, cam, scale, alpha=0.5):
+    """Blend the heatmap over the image (jet colormap, red = most influential).
+
+    `scale` is the shared denominator across the classes shown side by side.
+    """
+    cam = (cam / scale).clamp(0, 1)
+    img = img.convert("RGB")
+    # Training resizes to a square 224x224, so scaling the CAM back to the
+    # original size undoes exactly that squash — no misalignment.
+    cam_img = Image.fromarray((cam.numpy() * 255).astype("uint8")).resize(
+        img.size, Image.BICUBIC
+    )
+    heat = matplotlib.colormaps["jet"](np.asarray(cam_img) / 255.0)[..., :3]
+    return Image.blend(img, Image.fromarray((heat * 255).astype("uint8")), alpha)
+
+
+# A map whose maximum is (near) zero has no positive evidence at all: the ReLU
+# above wiped it out. Below WEAK_FRACTION of the strongest map, what's left is
+# mostly noise and shouldn't be read as an explanation.
+FLAT_EPS = 1e-6
+WEAK_FRACTION = 0.25
+# Gradient magnitude only loosely tracks confidence — a class scoring 0.1% can
+# still produce a mid-strength map, because the gradient says "what would raise
+# this score", not "what the model believes". So gate on the probability too:
+# below this the model has effectively ruled the class out, whatever its map
+# looks like.
+MIN_PROB = 0.05
+
+
 # ---------------- UI ----------------
-st.set_page_config(page_title="Skin Lesion Classifier", page_icon="🔬")
-st.title("Skin Lesion Classifier")
+st.set_page_config(page_title="HAM10000 Skin Lesion Classifier", page_icon="🔬")
+st.title("HAM10000 Skin Lesion Classifier")
 st.header("Decision-Support Demo")
 st.markdown(
     "Upload a dermatoscopic image (or pick an example). The model — a **ResNet18** "
@@ -142,9 +205,57 @@ with st.container(border=True):
     else:
         st.info("⬆️ Upload an image or click an example above to see a prediction.")
 
+# ----- Card 3: where the model looked -----
+with st.container(border=True):
+    st.markdown("#### 3 · Explainability: Where the model *looked* (Grad-CAM)")
+    if img is not None:
+        # Only the two classes actually in contention. For a class the model
+        # rejects, its reason is the *absence* of features — which Grad-CAM's
+        # ReLU discards by construction, leaving noise or an empty map.
+        top2 = df.index[:2].tolist()
+        cams = {c: gradcam(model, img, CLASSES.index(c)) for c in top2}
+        # One shared scale for both maps, so their strengths stay comparable.
+        scale = max(FLAT_EPS, *(float(c.max()) for c in cams.values()))
+
+        cols = st.columns(3)
+        with cols[0]:
+            st.image(img, caption="Input", width="stretch")
+        for col, cls in zip(cols[1:], top2):
+            with col:
+                cam, peak = cams[cls], float(cams[cls].max())
+                if peak <= FLAT_EPS:
+                    st.info(
+                        f"**{cls}** · {probs[cls] * 100:.1f}%\n\n"
+                        "No positive evidence anywhere in the image — the model rejects "
+                        "this class because features are *missing*, which Grad-CAM cannot "
+                        "show."
+                    )
+                else:
+                    st.image(overlay_cam(img, cam, scale),
+                             caption=f"{cls} · {probs[cls] * 100:.1f}%", width="stretch")
+                    if probs[cls] < MIN_PROB:
+                        st.caption(
+                            f"⚠️ The model has ruled this class out ({probs[cls] * 100:.1f}%). "
+                            "The map shows which regions *would* speak for it — not a reason "
+                            "behind the actual prediction."
+                        )
+                    elif peak < WEAK_FRACTION * scale:
+                        st.caption(
+                            f"⚠️ Weak signal ({peak / scale * 100:.0f}% of the map beside "
+                            "it) — closer to noise than to an explanation."
+                        )
+        st.caption(
+            "Red marks the regions that pushed that class's score up, blue the ones that "
+            "barely mattered; both maps share one colour scale, so a paler map really is "
+            "weaker evidence. They are 7×7 pixels upscaled — read them as a rough area, "
+            "not a lesion border. Attention on skin, ruler marks or vignetting is a hint "
+            "the model latched onto an artefact rather than the lesion."
+        )
+    else:
+        st.info("⬆️ Pick an image above to see the Grad-CAM heatmaps.")
+
 st.markdown(
-    "---\n**How it was built:** ResNet18 transfer learning on HAM10000, handling severe "
-    "class imbalance (~67% benign nevi), evaluated with a focus on melanoma recall. "
+    "---\n**How it was built:** "
     "Full notebooks & honest analysis: "
     "[GitHub repo](https://github.com/sabrinahartung/ham10000-skin-lesion-classification)."
 )

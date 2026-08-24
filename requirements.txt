@@ -5,4 +5,6 @@ torch
 torchvision
 pillow
 pandas
+matplotlib
+numpy
 huggingface_hub
